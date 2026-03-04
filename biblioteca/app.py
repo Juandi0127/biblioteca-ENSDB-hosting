@@ -16,6 +16,45 @@ import shutil
 
 USE_MYSQL = bool(os.environ.get("MYSQL_DATABASE"))
 
+# keep track of whether we've already ensured the database exists in
+# this process. gunicorn spawns workers that import the module without
+# executing the main block, so we must handle creation lazily.
+_mysql_init_done = False
+
+def ensure_mysql_database():
+    """Create the database on the server if it doesn't exist.
+
+    Railway sometimes provisions a fresh MySQL instance where the
+    database name in the environment may not yet exist.  Connecting to a
+    non‑existent database yields "Unknown database" errors; we catch and
+    mitigate that by creating it on the first connection attempt.
+    """
+    dbname = os.environ.get('MYSQL_DATABASE')
+    if not dbname:
+        return
+    import mysql.connector
+    admin = mysql.connector.connect(
+        host=os.environ.get('MYSQL_HOST', 'localhost'),
+        user=os.environ.get('MYSQL_USER', 'root'),
+        password=os.environ.get('MYSQL_PASSWORD', ''),
+    )
+    admin_cur = admin.cursor()
+    admin_cur.execute(
+        f"CREATE DATABASE IF NOT EXISTS `{dbname}` "
+        "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+    )
+    admin.commit()
+    admin_cur.close()
+    admin.close()
+
+def maybe_ensure_database():
+    """No-op after the database has been created once."""
+    global _mysql_init_done
+    if USE_MYSQL and not _mysql_init_done:
+        ensure_mysql_database()
+        _mysql_init_done = True
+
+
 
 app = Flask(__name__)
 app.secret_key = 'ENSDB123'
@@ -60,6 +99,8 @@ def ensure_mysql_database():
 def get_db_connection():
     # choose backend based on environment; leave sqlite as default
     if USE_MYSQL:
+        # ensure the database exists before attempting to open it
+        maybe_ensure_database()
         import mysql.connector
         conn = mysql.connector.connect(
             host=os.environ.get('MYSQL_HOST', 'localhost'),
@@ -249,6 +290,16 @@ def aplicar_migraciones():
             execute(conn, 'ALTER TABLE prestamo ADD COLUMN fecha_devolucion TEXT')
         conn.commit()
 
+
+# register startup handler to create tables/migrations before first request
+@app.before_first_request
+def initialize_database():
+    # this runs in each worker process exactly once
+    if USE_MYSQL:
+        maybe_ensure_database()
+    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+    crear_tablas()
+    aplicar_migraciones()
 
 # --- User Routes ---
 @app.route('/', methods=['GET', 'POST'])
