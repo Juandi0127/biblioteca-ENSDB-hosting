@@ -1,0 +1,828 @@
+from flask import Flask, render_template, request, redirect, url_for, session, flash, send_from_directory, jsonify
+import sqlite3
+from datetime import datetime, timedelta
+import os
+import time
+from werkzeug.utils import secure_filename
+import shutil
+
+# --- database configuration ----------------------------------------------
+# when you deploy to Railway you can provision a MySQL addon; Railway
+# exposes connection details via environment variables.  if
+# ``MYSQL_DATABASE`` is set we switch to a MySQL client, otherwise we
+# continue using the embedded SQLite file during local development.
+# the driver is not imported until needed so the app still runs without
+# the MySQL package installed.
+
+USE_MYSQL = bool(os.environ.get("MYSQL_DATABASE"))
+
+
+app = Flask(__name__)
+app.secret_key = 'ENSDB123'
+
+DATABASE = 'biblioteca.db'
+# NEW: usar ruta absoluta dentro del paquete 'biblioteca'
+BASE_DIR = os.path.dirname(__file__)
+UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
+# helper that normalises query execution between sqlite3 and MySQL
+# - sqlite uses ? placeholders; MySQL drivers expect %s
+# - sqlite connections allow execute() directly; MySQL requires cursor()
+
+def get_db_connection():
+    # choose backend based on environment; leave sqlite as default
+    if USE_MYSQL:
+        import mysql.connector
+        conn = mysql.connector.connect(
+            host=os.environ.get('MYSQL_HOST', 'localhost'),
+            user=os.environ.get('MYSQL_USER', 'root'),
+            password=os.environ.get('MYSQL_PASSWORD', ''),
+            database=os.environ.get('MYSQL_DATABASE'),
+            charset='utf8mb4',
+        )
+        return conn
+    else:
+        conn = sqlite3.connect(DATABASE)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+
+def execute(conn, query, params=()):
+    """Run a query and return a cursor.
+
+    The returned cursor supports ``fetchall``/``fetchone``.  ``params``
+    should be a tuple.  ``?`` placeholders are rewritten to ``%s`` when
+    using MySQL.
+    """
+    if USE_MYSQL:
+        query = query.replace('?', '%s')
+        cur = conn.cursor(dictionary=True)
+    else:
+        cur = conn.cursor()
+    cur.execute(query, params)
+    return cur
+
+
+ALLOWED_EXT = {'png', 'jpg', 'jpeg', 'gif', 'pdf'}
+
+def allowed_file(filename):
+    return filename and '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXT
+
+def save_file(file):
+    if not file or file.filename == '':
+        return None
+    if not allowed_file(file.filename):
+        return None
+    fname = secure_filename(file.filename)
+    fname = f"{int(time.time())}_{fname}"
+    # asegurar carpeta uploads dentro del paquete
+    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+    dst = os.path.join(app.config['UPLOAD_FOLDER'], fname)
+    file.save(dst)
+
+    # opcional: copiar imágenes a static/images para verlas fácilmente
+    ext = fname.rsplit('.', 1)[1].lower()
+    if ext in {'png', 'jpg', 'jpeg', 'gif'}:
+        static_images_dir = os.path.join(BASE_DIR, 'static', 'images')
+        os.makedirs(static_images_dir, exist_ok=True)
+        try:
+            shutil.copyfile(dst, os.path.join(static_images_dir, fname))
+        except Exception as e:
+            print("WARN: no se pudo copiar la portada a static/images:", e)
+
+    # DEBUG: imprimir rutas y nombre guardado
+    print("DEBUG saved file:", dst)
+    return fname
+
+def crear_tablas():
+    with get_db_connection() as conn:
+        # table creation differs slightly between sqlite and mysql
+        if USE_MYSQL:
+            execute(conn, '''
+                CREATE TABLE IF NOT EXISTS biblioteca_virtual (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    titulo TEXT,
+                    descripcion TEXT,
+                    filename TEXT,
+                    cover_filename TEXT,
+                    curso TEXT,
+                    letra TEXT,
+                    letra_from TEXT,
+                    letra_to TEXT,
+                    fecha_subida TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB
+            ''')
+            conn.commit()
+            cols = [r['Field'] for r in execute(conn, "SHOW COLUMNS FROM biblioteca_virtual").fetchall()]
+        else:
+            execute(conn, '''
+                CREATE TABLE IF NOT EXISTS biblioteca_virtual (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    titulo TEXT,
+                    descripcion TEXT,
+                    filename TEXT,
+                    cover_filename TEXT,
+                    curso TEXT,
+                    letra TEXT,
+                    letra_from TEXT,
+                    letra_to TEXT,
+                    fecha_subida TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.commit()
+            cols = [r[1] for r in execute(conn, "PRAGMA table_info(biblioteca_virtual)").fetchall()]
+
+        # mantener compatibilidad con versiones previas
+        if 'cover_filename' not in cols:
+            try:
+                execute(conn, "ALTER TABLE biblioteca_virtual ADD COLUMN cover_filename TEXT")
+                conn.commit()
+            except Exception:
+                pass
+        if 'curso' not in cols:
+            try:
+                execute(conn, "ALTER TABLE biblioteca_virtual ADD COLUMN curso TEXT")
+                conn.commit()
+            except Exception:
+                pass
+        if 'letra' not in cols:
+            try:
+                execute(conn, "ALTER TABLE biblioteca_virtual ADD COLUMN letra TEXT")
+                conn.commit()
+            except Exception:
+                pass
+        # nuevas columnas para rango (admin)
+        if 'letra_from' not in cols:
+            try:
+                execute(conn, "ALTER TABLE biblioteca_virtual ADD COLUMN letra_from TEXT")
+                conn.commit()
+            except Exception:
+                pass
+        if 'letra_to' not in cols:
+            try:
+                execute(conn, "ALTER TABLE biblioteca_virtual ADD COLUMN letra_to TEXT")
+                conn.commit()
+            except Exception:
+                pass
+
+        # asegurar columna portada en libro si tabla vieja no la tiene
+        if USE_MYSQL:
+            cols_libro = [r['Field'] for r in execute(conn, "SHOW COLUMNS FROM libro").fetchall()]
+        else:
+            cols_libro = [r[1] for r in execute(conn, "PRAGMA table_info(libro)").fetchall()]
+        if 'portada_filename' not in cols_libro:
+            try:
+                execute(conn, "ALTER TABLE libro ADD COLUMN portada_filename TEXT")
+                conn.commit()
+            except Exception:
+                pass
+    conn.close()
+
+def generar_codigo_libro(conn, seccion, libro_id):
+    seccion_prefix = seccion[:3].upper()
+    return f"{seccion_prefix}-{libro_id:03d}"
+
+def aplicar_migraciones():
+    with get_db_connection() as conn:
+        # inspect columns using the appropriate dialect
+        if USE_MYSQL:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SHOW COLUMNS FROM libro")
+            columnas_libro = [col['Field'] for col in cursor.fetchall()]
+        else:
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(libro)")
+            columnas_libro = [column['name'] for column in cursor.fetchall()]
+
+        if 'codigo_libro' not in columnas_libro:
+            print("Applying migration: Adding 'codigo_libro' to 'libro' table.")
+            execute(conn, 'ALTER TABLE libro ADD COLUMN codigo_libro TEXT')
+            conn.commit()
+            # --- Populate existing books with codes ---
+            libros = execute(conn, 'SELECT id, seccion FROM libro').fetchall()
+            for libro in libros:
+                codigo = generar_codigo_libro(conn, libro['seccion'], libro['id'])
+                execute(conn, 'UPDATE libro SET codigo_libro = ? WHERE id = ?', (codigo, libro['id']))
+            conn.commit()
+            print(f"{len(libros)} existing books updated with codes.")
+
+        if USE_MYSQL:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SHOW COLUMNS FROM prestamo")
+            columnas_prestamo = [col['Field'] for col in cursor.fetchall()]
+        else:
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(prestamo)")
+            columnas_prestamo = [column['name'] for column in cursor.fetchall()]
+
+        if 'reseñado' not in columnas_prestamo:
+            execute(conn, 'ALTER TABLE prestamo ADD COLUMN reseñado INTEGER DEFAULT 0')
+        if 'fecha_devolucion' not in columnas_prestamo:
+            execute(conn, 'ALTER TABLE prestamo ADD COLUMN fecha_devolucion TEXT')
+        conn.commit()
+
+
+# --- User Routes ---
+@app.route('/', methods=['GET', 'POST'])
+def login():
+    if 'correo' in session:
+        return redirect(url_for('dashboard'))
+    if request.method == 'POST':
+        correo = request.form['correo']
+        if correo.endswith('@ensdbexcelencia.edu.co'):
+            session['correo'] = correo
+            return redirect(url_for('dashboard'))
+        else:
+            flash('Debes usar tu correo institucional para iniciar sesión.', 'error')
+    return render_template('login.html')
+
+@app.route('/dashboard')
+def dashboard():
+    if 'correo' not in session:
+        return redirect(url_for('login'))
+
+    conn = get_db_connection()
+    
+    # Get search and filter parameters
+    search_query = request.args.get('search', '')
+    seccion_filter = request.args.get('seccion', '')
+
+    # Fetch all unique sections for the dropdown
+    secciones_disponibles_raw = execute(conn, 'SELECT DISTINCT seccion FROM libro ORDER BY seccion').fetchall()
+    secciones_disponibles = [row['seccion'] for row in secciones_disponibles_raw]
+
+    # Dashboard analytics
+    libros_populares = execute(conn, """
+        SELECT l.id, l.titulo, l.autor, COUNT(p.libro_id) as total_prestamos
+        FROM libro l JOIN prestamo p ON l.id = p.libro_id
+        GROUP BY l.id, l.titulo, l.autor
+        ORDER BY total_prestamos DESC LIMIT 5
+    """).fetchall()
+
+    libros_mejor_calificados = execute(conn, """
+        SELECT l.id, l.titulo, l.autor, AVG(r.calificacion) as avg_rating
+        FROM libro l JOIN reseña r ON l.id = r.libro_id
+        GROUP BY l.id, l.titulo, l.autor
+        ORDER BY avg_rating DESC LIMIT 5
+    """).fetchall()
+
+    # Build the query based on filters
+    query = "SELECT * FROM libro WHERE stock > 0"
+    params = []
+
+    if search_query:
+        query += " AND (titulo LIKE ? OR autor LIKE ? OR codigo_libro LIKE ?)"
+        params.extend([f'%{search_query}%', f'%{search_query}%', f'%{search_query}%'])
+
+    if seccion_filter:
+        query += " AND seccion = ?"
+        params.append(seccion_filter)
+
+    query += " ORDER BY seccion, titulo"
+    libros = execute(conn, query, params).fetchall()
+    
+    # Group books by section for display
+    secciones_agrupadas = {}
+    if search_query or seccion_filter: 
+        # If filtering, group results under a single header
+        if libros:
+            secciones_agrupadas['Resultados de la Búsqueda'] = libros
+    else:
+        # On default view, group by actual section
+        for libro in libros:
+            secciones_agrupadas.setdefault(libro['seccion'], []).append(libro)
+
+    conn.close()
+    
+    return render_template('dashboard.html', 
+                            correo=session['correo'], 
+                            secciones_agrupadas=secciones_agrupadas, 
+                            search=search_query,
+                            secciones_disponibles=secciones_disponibles,
+                            seccion_actual=seccion_filter,
+                            libros_populares=libros_populares, 
+                            libros_mejor_calificados=libros_mejor_calificados,
+                            page='dashboard')
+
+
+@app.route('/libro/<int:libro_id>')
+def libro_detalle(libro_id):
+    if 'correo' not in session:
+        return redirect(url_for('login'))
+
+    conn = get_db_connection()
+    libro = execute(conn, 'SELECT * FROM libro WHERE id = ?', (libro_id,)).fetchone()
+
+    if not libro:
+        flash('El libro no fue encontrado.', 'error')
+        return redirect(url_for('dashboard'))
+
+    reseñas = execute(conn, 'SELECT * FROM reseña WHERE libro_id = ? ORDER BY fecha DESC', (libro_id,)).fetchall()
+    avg_rating_result = execute(conn, 'SELECT AVG(calificacion) as avg FROM reseña WHERE libro_id = ?', (libro_id,)).fetchone()
+    avg_rating = round(avg_rating_result['avg'], 1) if avg_rating_result['avg'] else 0
+    
+    conn.close()
+    return render_template('libro_detalle.html', libro=libro, reseñas=reseñas, avg_rating=avg_rating)
+
+@app.route('/prestar/<int:libro_id>', methods=['GET', 'POST'])
+def prestar(libro_id):
+    if 'correo' not in session:
+        return redirect(url_for('login'))
+    
+    conn = get_db_connection()
+    libro = execute(conn, 'SELECT * FROM libro WHERE id = ? AND stock > 0', (libro_id,)).fetchone()
+
+    if not libro:
+        flash('El libro no está disponible o no existe.', 'error')
+        return redirect(url_for('dashboard'))
+
+    if request.method == 'POST':
+        nombre = request.form['nombre']
+        grado = request.form['grado']
+        curso = request.form['curso']
+        dias = int(request.form['dias'])
+        
+        if dias <= 0 or dias > 62:
+            flash('El número de días para el préstamo debe ser entre 1 y 62.', 'error')
+            return render_template('prestar.html', libro=libro)
+
+        fecha_prestamo = datetime.now().strftime('%Y-%m-%d')
+        
+        execute(conn, 
+            'INSERT INTO prestamo (nombre, grado, curso, libro_id, dias, correo, fecha_prestamo) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (nombre, grado, curso, libro_id, dias, session['correo'], fecha_prestamo)
+        )
+        execute(conn, 'UPDATE libro SET stock = stock - 1 WHERE id = ?', (libro_id,))
+        conn.commit()
+        conn.close()
+        
+        flash(f'¡Préstamo del libro "{libro["titulo"]}" solicitado con éxito!', 'success')
+        return redirect(url_for('dashboard'))
+
+    conn.close()
+    return render_template('prestar.html', libro=libro)
+
+@app.route('/perfil')
+def perfil():
+    if 'correo' not in session:
+        return redirect(url_for('login'))
+    
+    conn = get_db_connection()
+    user_email = session['correo']
+    
+    prestamos_activos_raw = execute(conn, """
+        SELECT p.*, l.titulo AS libro, l.autor, l.codigo_libro
+        FROM prestamo p JOIN libro l ON p.libro_id = l.id 
+        WHERE p.correo = ? AND p.devuelto = 0
+    """, (user_email,)).fetchall()
+
+    prestamos_activos = []
+    hoy = datetime.now()
+    for p in prestamos_activos_raw:
+        p_dict = dict(p)
+        fecha_inicio = datetime.strptime(p['fecha_prestamo'], '%Y-%m-%d')
+        fecha_fin = fecha_inicio + timedelta(days=int(p['dias']))
+        dias_restantes = (fecha_fin - hoy).days + 1
+        p_dict['fecha_devolucion_estimada'] = fecha_fin.strftime('%Y-%m-%d')
+        p_dict['dias_restantes'] = dias_restantes if dias_restantes >= 0 else -1
+        prestamos_activos.append(p_dict)
+
+    historial = execute(conn, """
+        SELECT p.*, l.titulo AS libro, l.codigo_libro
+        FROM prestamo p JOIN libro l ON p.libro_id = l.id 
+        WHERE p.correo = ? ORDER BY p.fecha_prestamo DESC
+    """, (user_email,)).fetchall()
+    
+    conn.close()
+    return render_template('perfil.html', correo=user_email, prestamos=prestamos_activos, historial=historial)
+
+@app.route('/escribir_reseña/<int:prestamo_id>', methods=['GET', 'POST'])
+def escribir_reseña(prestamo_id):
+    if 'correo' not in session:
+        return redirect(url_for('login'))
+
+    conn = get_db_connection()
+    prestamo = execute(conn, 'SELECT * FROM prestamo WHERE id = ?', (prestamo_id,)).fetchone()
+
+    if not prestamo or prestamo['correo'] != session['correo'] or not prestamo['devuelto']:
+        flash('No puedes reseñar este libro.', 'error')
+        return redirect(url_for('perfil'))
+    if prestamo['reseñado']:
+        flash('Ya has reseñado este préstamo.', 'error')
+        return redirect(url_for('perfil'))
+
+    libro = execute(conn, 'SELECT * FROM libro WHERE id = ?', (prestamo['libro_id'],)).fetchone()
+
+    if request.method == 'POST':
+        calificacion = request.form.get('calificacion')
+        comentario = request.form.get('comentario')
+        
+        if not calificacion:
+            flash('Debes seleccionar una calificación.', 'error')
+            return render_template('escribir_reseña.html', libro=libro, prestamo=prestamo)
+
+        fecha_reseña = datetime.now().strftime('%Y-%m-%d')
+        execute(conn, 
+            'INSERT INTO reseña (libro_id, correo, calificacion, comentario, fecha) VALUES (?, ?, ?, ?, ?)',
+            (libro['id'], session['correo'], calificacion, comentario, fecha_reseña)
+        )
+        execute(conn, 'UPDATE prestamo SET reseñado = 1 WHERE id = ?', (prestamo_id,))
+        conn.commit()
+        conn.close()
+
+        flash('¡Gracias por tu reseña!', 'success')
+        return redirect(url_for('perfil'))
+
+    conn.close()
+    return render_template('escribir_reseña.html', libro=libro, prestamo=prestamo)
+
+@app.route('/logout')
+def logout():
+    session.pop('correo', None)
+    flash('Has cerrado sesión.', 'success')
+    return redirect(url_for('login'))
+
+# --- Admin Routes ---
+
+ADMIN_PASSWORD = 'ENSDB123'
+
+@app.route('/admin_login', methods=['GET', 'POST'])
+def admin_login():
+    if 'admin' in session:
+        return redirect(url_for('admin_panel'))
+    if request.method == 'POST':
+        password = request.form.get('password')
+        if password == ADMIN_PASSWORD:
+            session['admin'] = True
+            return redirect(url_for('admin_panel'))
+        else:
+            flash('Contraseña incorrecta.', 'error')
+    return render_template('admin_login.html')
+
+@app.route('/admin_panel')
+def admin_panel():
+    if not session.get('admin'):
+        return redirect(url_for('admin_login'))
+    return render_template('admin_panel.html')
+
+@app.route('/admin_libros', methods=['GET', 'POST'])
+def admin_libros():
+    if not session.get('admin'):
+        return redirect(url_for('admin_login'))
+    
+    conn = get_db_connection()
+    if request.method == 'POST' and request.form.get('_method') != 'DELETE':
+        titulo = request.form['titulo']
+        autor = request.form['autor']
+        editorial = request.form['editorial']
+        stock = request.form['stock']
+        seccion = request.form['seccion']
+
+        # guardar portada si viene
+        portada_file = request.files.get('portada')
+        portada_fname = save_file(portada_file) if portada_file and portada_file.filename != '' else None
+        
+        cursor = conn.cursor()
+        cursor.execute(
+            'INSERT INTO libro (titulo, autor, editorial, stock, seccion, portada_filename) VALUES (?, ?, ?, ?, ?, ?)',
+            (titulo, autor, editorial, stock, seccion, portada_fname)
+        )
+        nuevo_libro_id = cursor.lastrowid
+        
+        codigo = generar_codigo_libro(conn, seccion, nuevo_libro_id)
+        execute(conn, 'UPDATE libro SET codigo_libro = ? WHERE id = ?', (codigo, nuevo_libro_id))
+        
+        conn.commit()
+        flash(f'Libro "{titulo}" (Código: {codigo}) añadido correctamente.', 'success')
+
+    libros = execute(conn, 'SELECT * FROM libro ORDER BY seccion, codigo_libro').fetchall()
+    conn.close()
+    return render_template('admin_libros.html', libros=libros)
+
+@app.route('/admin_editar_libro/<int:libro_id>', methods=['GET', 'POST'])
+def admin_editar_libro(libro_id):
+    if not session.get('admin'):
+        return redirect(url_for('admin_login'))
+
+    conn = get_db_connection()
+
+    if request.method == 'POST':
+        titulo = request.form['titulo']
+        autor = request.form['autor']
+        editorial = request.form['editorial']
+        stock = request.form['stock']
+        seccion = request.form['seccion']
+        
+        codigo = generar_codigo_libro(conn, seccion, libro_id)
+        execute(conn, 
+            'UPDATE libro SET titulo = ?, autor = ?, editorial = ?, stock = ?, seccion = ?, codigo_libro = ? WHERE id = ?',
+            (titulo, autor, editorial, stock, seccion, codigo, libro_id)
+        )
+        conn.commit()
+        conn.close()
+        
+        flash(f'Libro "{titulo}" (Código: {codigo}) actualizado correctamente.', 'success')
+        return redirect(url_for('admin_libros'))
+
+    libro = execute(conn, 'SELECT * FROM libro WHERE id = ?', (libro_id,)).fetchone()
+    conn.close()
+    
+    if libro is None:
+        flash('El libro no fue encontrado.', 'error')
+        return redirect(url_for('admin_libros'))
+        
+    return render_template('admin_editar_libro.html', libro=libro)
+
+@app.route('/admin_eliminar_libro/<int:libro_id>', methods=['POST'])
+def admin_eliminar_libro(libro_id):
+    if not session.get('admin'):
+        return redirect(url_for('admin_login'))
+
+    conn = get_db_connection()
+    
+    loan_count = execute(conn, 'SELECT COUNT(*) FROM prestamo WHERE libro_id = ?', (libro_id,)).fetchone()[0]
+    
+    if loan_count > 0:
+        flash(f'No se puede eliminar este libro porque tiene un historial de {loan_count} préstamo(s). Para darlo de baja, edítalo y pon su stock a 0.', 'error')
+    else:
+        libro = execute(conn, 'SELECT titulo FROM libro WHERE id = ?', (libro_id,)).fetchone()
+        execute(conn, 'DELETE FROM libro WHERE id = ?', (libro_id,))
+        conn.commit()
+        flash(f'Libro "{libro["titulo"]}" eliminado permanentemente ya que no tenía préstamos asociados.', 'success')
+        
+    conn.close()
+    return redirect(url_for('admin_libros'))
+
+@app.route('/admin_prestamos')
+def admin_prestamos():
+    if not session.get('admin'):
+        return redirect(url_for('admin_login'))
+    
+    conn = get_db_connection()
+    prestamos_raw = execute(conn, """
+        SELECT p.*, l.titulo as libro, l.codigo_libro 
+        FROM prestamo p JOIN libro l ON p.libro_id = l.id
+        WHERE p.devuelto = 0 
+        ORDER BY p.fecha_prestamo
+    """).fetchall()
+    
+    prestamos_list = []
+    hoy = datetime.now()
+    for p in prestamos_raw:
+        p_dict = dict(p)
+        fecha_inicio = datetime.strptime(p['fecha_prestamo'], '%Y-%m-%d')
+        fecha_fin = fecha_inicio + timedelta(days=int(p['dias']))
+        dias_restantes = (fecha_fin - hoy).days + 1
+        p_dict['dias_restantes'] = dias_restantes
+        prestamos_list.append(p_dict)
+
+    conn.close()
+    return render_template('admin_prestamos.html', prestamos=prestamos_list)
+
+@app.route('/devolver_prestamo/<int:prestamo_id>', methods=['POST'])
+def devolver_prestamo(prestamo_id):
+    if not session.get('admin'):
+        return redirect(url_for('admin_login'))
+
+    conn = get_db_connection()
+    prestamo = execute(conn, 'SELECT libro_id FROM prestamo WHERE id = ?', (prestamo_id,)).fetchone()
+    
+    if prestamo:
+        fecha_devolucion = datetime.now().strftime('%Y-%m-%d')
+        execute(conn, 'UPDATE prestamo SET devuelto = 1, fecha_devolucion = ? WHERE id = ?', (fecha_devolucion, prestamo_id))
+        execute(conn, 'UPDATE libro SET stock = stock + 1 WHERE id = ?', (prestamo['libro_id'],))
+        conn.commit()
+        flash('Préstamo marcado como devuelto y libro repuesto al stock.', 'success')
+    else:
+        flash('No se encontró el préstamo.', 'error')
+        
+    conn.close()
+    return redirect(url_for('admin_prestamos'))
+
+@app.route('/admin_historial')
+def admin_historial():
+    if not session.get('admin'):
+        return redirect(url_for('admin_login'))
+
+    search_query = request.args.get('search', '')
+    conn = get_db_connection()
+
+    base_query = """SELECT p.*, l.titulo as libro, l.codigo_libro
+                    FROM prestamo p JOIN libro l ON p.libro_id = l.id"""
+    params = []
+
+    if search_query:
+        base_query += " WHERE p.nombre LIKE ? OR p.correo LIKE ? OR l.titulo LIKE ? OR l.codigo_libro LIKE ?"
+        params = [f'%{search_query}%'] * 4
+    
+    base_query += " ORDER BY p.fecha_prestamo DESC"
+
+    prestamos = execute(conn, base_query, params).fetchall()
+    conn.close()
+    
+    return render_template('admin_historial.html', prestamos=prestamos, search=search_query)
+
+@app.route('/admin_estadisticas')
+def admin_estadisticas():
+    if not session.get('admin'):
+        return redirect(url_for('admin_login'))
+    
+    conn = get_db_connection()
+    libros_populares = execute(conn, """
+        SELECT l.titulo as libro, COUNT(p.libro_id) as total, l.codigo_libro
+        FROM prestamo p JOIN libro l ON p.libro_id = l.id
+        GROUP BY l.titulo
+        ORDER BY total DESC
+        LIMIT 5
+    """).fetchall()
+    usuarios_activos = execute(conn, """
+        SELECT nombre, correo, COUNT(*) as total
+        FROM prestamo
+        GROUP BY correo
+        ORDER BY total DESC
+        LIMIT 5
+    """).fetchall()
+    total_prestamos = execute(conn, 'SELECT COUNT(*) FROM prestamo').fetchone()[0]
+    total_libros = execute(conn, 'SELECT SUM(stock) FROM libro').fetchone()[0]
+    conn.close()
+    
+    return render_template('admin_estadisticas.html',
+                            libros_populares=libros_populares,
+                            usuarios_activos=usuarios_activos,
+                            total_prestamos=total_prestamos,
+                            total_libros=total_libros or 0)
+
+@app.route('/logout_admin')
+def logout_admin():
+    session.pop('admin', None)
+    flash('Has cerrado la sesión de administrador.', 'success')
+    return redirect(url_for('login'))
+
+# --- Virtual Library Routes ---
+@app.route('/biblioteca_virtual')
+def biblioteca_virtual():
+    if 'correo' not in session:
+        return redirect(url_for('login'))
+
+    search_query = request.args.get('search', '').strip()
+    curso_filter = request.args.get('curso', '').strip()
+    letra_filter = request.args.get('letra', '').strip().upper()[:1] if request.args.get('letra') else ''
+
+    conn = get_db_connection()
+    query = "SELECT * FROM biblioteca_virtual WHERE 1=1"
+    params = []
+
+    if search_query:
+        query += " AND titulo LIKE ?"
+        params.append(f'%{search_query}%')
+
+    if curso_filter:
+        query += " AND curso = ?"
+        params.append(curso_filter)
+
+    if letra_filter:
+        # coincidir letra única OR estar dentro del rango definido por admin (letra_from <= letra <= letra_to)
+        query += (" AND (UPPER(letra) = ? OR "
+                    "(letra_from IS NOT NULL AND letra_to IS NOT NULL AND UPPER(letra_from) <= ? AND UPPER(letra_to) >= ?))")
+        params.extend([letra_filter, letra_filter, letra_filter])
+
+    query += " ORDER BY fecha_subida DESC"
+    documentos = execute(conn, query, params).fetchall()
+    conn.close()
+    return render_template('biblioteca_virtual.html',
+                            documentos=documentos,
+                            page='biblioteca_virtual',
+                            search=search_query,
+                            curso=curso_filter,
+                            letra=letra_filter)
+
+
+@app.route('/api/documentos/titulos')
+def documentos_titulos():
+    conn = get_db_connection()
+    titulos = execute(conn, "SELECT DISTINCT titulo FROM biblioteca_virtual").fetchall()
+    conn.close()
+    return jsonify([titulo['titulo'] for titulo in titulos])
+
+@app.route('/admin/biblioteca_virtual', methods=['GET', 'POST'])
+def admin_biblioteca_virtual():
+    if not session.get('admin'):
+        return redirect(url_for('admin_login'))
+
+    if request.method == 'POST':
+        titulo = request.form.get('titulo','').strip()
+        descripcion = request.form.get('descripcion','').strip()
+        curso = request.form.get('curso','').strip()
+        # admin puede indicar rango: letra_from y letra_to (opcionales)
+        letra_from = (request.form.get('letra_from') or '').strip().upper()[:1] or None
+        letra_to = (request.form.get('letra_to') or '').strip().upper()[:1] or None
+        # también conservar campo letra individual si se usa (compatibilidad)
+        letra = (request.form.get('letra') or '').strip().upper()[:1] or None
+
+        file = request.files.get('file')
+        if file and file.filename != '':
+            filename = save_file(file)
+            fecha_subida = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            conn = get_db_connection()
+            execute(conn, 
+                'INSERT INTO biblioteca_virtual (titulo, descripcion, filename, fecha_subida, curso, letra, letra_from, letra_to) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                (titulo, descripcion, filename, fecha_subida, curso, letra, letra_from, letra_to)
+            )
+            conn.commit()
+            conn.close()
+            flash('Documento subido exitosamente.', 'success')
+        else:
+            flash('No se seleccionó ningún archivo.', 'error')
+        return redirect(url_for('admin_biblioteca_virtual'))
+
+    conn = get_db_connection()
+    documentos = execute(conn, 'SELECT * FROM biblioteca_virtual ORDER BY fecha_subida DESC').fetchall()
+    conn.close()
+    return render_template('admin_biblioteca_virtual.html', documentos=documentos)
+
+@app.route('/admin/biblioteca_virtual/edit/<int:doc_id>', methods=['GET', 'POST'])
+def admin_edit_biblioteca_virtual(doc_id):
+    if not session.get('admin'):
+        return redirect(url_for('admin_login'))
+    conn = get_db_connection()
+    doc = execute(conn, 'SELECT * FROM biblioteca_virtual WHERE id = ?', (doc_id,)).fetchone()
+    if not doc:
+        conn.close()
+        flash('Documento no encontrado.', 'error')
+        return redirect(url_for('admin_biblioteca_virtual'))
+
+    if request.method == 'POST':
+        titulo = request.form.get('titulo','').strip()
+        descripcion = request.form.get('descripcion','').strip()
+        curso = request.form.get('curso','').strip()
+        letra_from = (request.form.get('letra_from') or '').strip().upper()[:1] or None
+        letra_to = (request.form.get('letra_to') or '').strip().upper()[:1] or None
+        letra = (request.form.get('letra') or '').strip().upper()[:1] or None
+
+        file = request.files.get('file')
+        filename = doc['filename']
+        if file and file.filename != '':
+            nuevo = save_file(file)
+            if nuevo:
+                try:
+                    old_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                    if filename and os.path.exists(old_path):
+                        os.remove(old_path)
+                    static_copy = os.path.join(BASE_DIR, 'static', 'images', filename)
+                    if os.path.exists(static_copy):
+                        os.remove(static_copy)
+                except Exception:
+                    pass
+                filename = nuevo
+        execute(conn, 'UPDATE biblioteca_virtual SET titulo = ?, descripcion = ?, filename = ?, curso = ?, letra = ?, letra_from = ?, letra_to = ? WHERE id = ?',
+                    (titulo, descripcion, filename, curso, letra, letra_from, letra_to, doc_id))
+        conn.commit()
+        conn.close()
+        flash('Documento actualizado.', 'success')
+        return redirect(url_for('admin_biblioteca_virtual'))
+
+    conn.close()
+    return render_template('admin_edit_biblioteca_virtual.html', doc=doc)
+
+@app.route('/admin/biblioteca_virtual/delete/<int:doc_id>', methods=['POST'])
+def admin_delete_biblioteca_virtual(doc_id):
+    if not session.get('admin'):
+        return redirect(url_for('admin_login'))
+    conn = get_db_connection()
+    doc = execute(conn, 'SELECT * FROM biblioteca_virtual WHERE id = ?', (doc_id,)).fetchone()
+    if not doc:
+        conn.close()
+        flash('Documento no encontrado.', 'error')
+        return redirect(url_for('admin_biblioteca_virtual'))
+
+    try:
+        if doc['filename']:
+            p = os.path.join(app.config['UPLOAD_FOLDER'], doc['filename'])
+            if os.path.exists(p):
+                os.remove(p)
+            static_copy = os.path.join(BASE_DIR, 'static', 'images', doc['filename'])
+            if os.path.exists(static_copy):
+                os.remove(static_copy)
+    except Exception:
+        pass
+
+    execute(conn, 'DELETE FROM biblioteca_virtual WHERE id = ?', (doc_id,))
+    conn.commit()
+    conn.close()
+    flash('Documento eliminado correctamente.', 'success')
+    return redirect(url_for('admin_biblioteca_virtual'))
+
+@app.route('/uploads/<filename>')
+def uploaded_file(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+if __name__ == '__main__':
+    # ensure uploads folder exists, run migrations on startup
+    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+    crear_tablas()
+    aplicar_migraciones()
+    # when deployed (Railway, etc) the platform sets PORT env var
+    port = int(os.environ.get('PORT', 5000))
+    debug_mode = os.environ.get('DEBUG', '0') in ('1', 'true', 'True')
+    app.run(host='0.0.0.0', port=port, debug=debug_mode)

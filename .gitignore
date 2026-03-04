@@ -1,0 +1,15 @@
+# virtual environments
+ll_env/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# local database
+biblioteca.db
+
+# uploads
+biblioteca/uploads/
+
+# other
+*.log
