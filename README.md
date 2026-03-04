@@ -43,10 +43,22 @@ tool below will create them for you when you run the application.
 4. In your system environment (or Railway settings) define variables:
 
    ```powershell
-   setx MYSQL_HOST localhost
+   setx MYSQL_HOST <host from Railway plugin>
    setx MYSQL_USER root
    setx MYSQL_PASSWORD "tu_contraseña"
-   setx MYSQL_DATABASE biblioteca
+   setx MYSQL_DATABASE <database name from Railway plugin>
+   ```
+
+   The code will attempt to create the database automatically on startup
+   if it does not yet exist, so you generally don't have to issue a
+   `CREATE DATABASE` statement yourself.  However, if you prefer to
+   create it manually (or if Railway uses a different default name), use
+   the following SQL:
+
+   ```sql
+   CREATE DATABASE IF NOT EXISTS `whatever_you_chose`
+     CHARACTER SET utf8mb4
+     COLLATE utf8mb4_unicode_ci;
    ```
 
    Restart your terminal after running `setx` so the variables take effect.

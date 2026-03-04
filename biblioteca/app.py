@@ -30,6 +30,33 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 # - sqlite uses ? placeholders; MySQL drivers expect %s
 # - sqlite connections allow execute() directly; MySQL requires cursor()
 
+def ensure_mysql_database():
+    """Create the database on the server if it doesn't exist.
+
+    Railway sometimes provisions an empty server and the database name
+    may not exist yet; attempting to connect to it results in "Unknown
+    database".  This helper runs once on startup to guarantee its
+    presence.
+    """
+    dbname = os.environ.get('MYSQL_DATABASE')
+    if not dbname:
+        return
+    import mysql.connector
+    admin = mysql.connector.connect(
+        host=os.environ.get('MYSQL_HOST', 'localhost'),
+        user=os.environ.get('MYSQL_USER', 'root'),
+        password=os.environ.get('MYSQL_PASSWORD', ''),
+    )
+    admin_cur = admin.cursor()
+    admin_cur.execute(
+        f"CREATE DATABASE IF NOT EXISTS `{dbname}` "
+        "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+    )
+    admin.commit()
+    admin_cur.close()
+    admin.close()
+
+
 def get_db_connection():
     # choose backend based on environment; leave sqlite as default
     if USE_MYSQL:
@@ -818,8 +845,11 @@ def uploaded_file(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
 if __name__ == '__main__':
-    # ensure uploads folder exists, run migrations on startup
+    # ensure uploads folder exists
     os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+    # make sure the remote database exists before we try to use it
+    if USE_MYSQL:
+        ensure_mysql_database()
     crear_tablas()
     aplicar_migraciones()
     # when deployed (Railway, etc) the platform sets PORT env var
